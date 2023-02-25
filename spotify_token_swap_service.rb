@@ -1,227 +1,118 @@
-require "sinatra"
-require "sinatra/json"
+require 'sinatra'
 require "sinatra/reloader" if File.exists?(".env")
 require "dotenv/load" if File.exists?(".env")
-require "active_support/all"
-require "base64"
-require "encrypted_strings"
-require "singleton"
-require "httparty"
+require 'net/http'
+require 'net/https'
+require 'base64'
+require 'json'
+require 'encrypted_strings'
 
-module SpotifyTokenSwapService
+# This is an example token swap service written
+# as a Ruby/Sinatra service. This is required by
+# the iOS SDK to authenticate a user.
+#
+# The service requires the Sinatra and
+# encrypted_strings gems be installed:
+#
+# $ gem install sinatra encrypted_strings
+#
+# To run the service, enter your client ID, client
+# secret and client callback URL below and run the
+# project.
+#
+# $ ruby spotify_token_swap.rb
+#
+# IMPORTANT: The example credentials will work for the
+# example apps, you should use your own in your real
+# environment. as these might change at any time.
+#
+# Once the service is running, pass the public URI to
+# it (such as http://localhost:1234/swap if you run it
+# with default settings on your local machine) to the
+# token swap method in the iOS SDK:
+#
+# SPTConfiguration *configuration = [SPTConfiguration configurationWithClientID:@"YOUR_CLIENT_ID"
+#                                                                   redirectURL:[NSURL URLWithString:@"spotify-login-sdk-test-app://spotify-login-callback"]];
+# configuration.tokenSwapURL = [NSURL urlWithString:@"http://localhost:1234/swap"];
+# configuration.tokenRefreshURL = [NSURL urlWithString:@"http://localhost:1234/refresh"];
+#
 
-  # SpotifyTokenSwapService::ConfigHelper
-  # SpotifyTokenSwapService::ConfigError
-  # SpotifyTokenSwapService::Config
-  #
-  # This deals with configuration, loaded through .env
-  #
-  module ConfigHelper
-    def config
-      @config ||= Config.instance
-    end
-  end
+print "\e[31m------------------------------------------------------\e[0m\n"
+print "\e[31mYou're using example credentials, please replace these\e[0m\n"
+print "\e[31mwith your own and remove this silly warning.\e[0m\n"
+print "\e[31m------------------------------------------------------\e[0m\n"
+print "\7\7"
+sleep(2)
+CLIENT_ID = ENV["SPOTIFY_CLIENT_ID"]
+CLIENT_SECRET = ENV["SPOTIFY_CLIENT_SECRET"]
+ENCRYPTION_SECRET = "<#EncryptionSecret#>"
+CLIENT_CALLBACK_URL = ENV["SPOTIFY_CLIENT_CALLBACK_URL"]
+AUTH_HEADER = "Basic " + ENV["ENCRYPTION_SECRET"]
+SPOTIFY_ACCOUNTS_ENDPOINT = URI.parse("https://accounts.spotify.com")
 
-  class ConfigError < StandardError
-    def self.empty
-      new("client credentials are empty")
-    end
-  end
+set :port, 1234 # The port to bind to.
+set :bind, '0.0.0.0' # IP address of the interface to listen on (all)
 
-  class Config < Struct.new(:client_id, :client_secret,
-                            :client_callback_url, :encryption_secret)
-    include Singleton
 
-    def initialize
-      self.client_id = ENV["SPOTIFY_CLIENT_ID"]
-      self.client_secret = ENV["SPOTIFY_CLIENT_SECRET"]
-      self.client_callback_url = ENV["SPOTIFY_CLIENT_CALLBACK_URL"]
-      self.encryption_secret = ENV["ENCRYPTION_SECRET"]
+post '/swap' do
 
-      validate_client_credentials
-    end
+    # This call takes a single POST parameter, "code", which
+    # it combines with your client ID, secret and callback
+    # URL to get an OAuth token from the Spotify Auth Service,
+    # which it will pass back to the caller in a JSON payload.
 
-    def has_client_credentials?
-      client_id.present? &&
-      client_secret.present? &&
-      client_callback_url.present?
-    end
+    auth_code = params[:code]
 
-    def has_encryption_secret?
-      encryption_secret.present?
-    end
+    http = Net::HTTP.new(SPOTIFY_ACCOUNTS_ENDPOINT.host, SPOTIFY_ACCOUNTS_ENDPOINT.port)
+    http.use_ssl = true
 
-    private
+    request = Net::HTTP::Post.new("/api/token")
 
-    def validate_client_credentials
-      raise ConfigError.empty unless has_client_credentials?
-    end
-  end
+    request.add_field("Authorization", AUTH_HEADER)
 
-  # SpotifyTokenSwapService::HTTP
-  #
-  # Make the HTTP requests, as handled by our lovely host, HTTParty.
-  #
-  class HTTP
-    include HTTParty,
-            ConfigHelper
-    base_uri "https://accounts.spotify.com"
+    request.form_data = {
+        "grant_type" => "authorization_code",
+        "redirect_uri" => CLIENT_CALLBACK_URL,
+        "code" => auth_code
+    }
 
-    def token(auth_code:)
-      options = default_options.deep_merge(query: {
-        grant_type: "authorization_code",
-        redirect_uri: config.client_callback_url,
-        code: auth_code
-      })
+    response = http.request(request)
 
-      self.class.post("/api/token", options)
-    end
-
-    def refresh_token(refresh_token:)
-      options = default_options.deep_merge(query: {
-        grant_type: "refresh_token",
-        refresh_token: refresh_token
-      })
-
-      self.class.post("/api/token", options)
-    end
-
-    private
-
-    def default_options
-      { headers: { Authorization: authorization_basic } }
+    # encrypt the refresh token before forwarding to the client
+    if response.code.to_i == 200
+        token_data = JSON.parse(response.body)
+        refresh_token = token_data["refresh_token"]
+        encrypted_token = refresh_token.encrypt(:symmetric, :password => ENCRYPTION_SECRET)
+        token_data["refresh_token"] = encrypted_token
+        response.body = JSON.dump(token_data)
     end
 
-    def authorization_basic
-      "Basic %s" % Base64.strict_encode64("%s:%s" % [
-        config.client_id,
-        config.client_secret
-      ])
-    end
-  end
+    status response.code.to_i
+    return response.body
+end
 
-  # SpotifyTokenSwapService::EncryptionMiddleware
-  #
-  # The code needed to apply encryption middleware for refresh tokens.
-  #
-  class EncryptionMiddleware < Struct.new(:httparty_instance)
-    include ConfigHelper
+post '/refresh' do
 
-    def run
-      response = httparty_instance.parsed_response.with_indifferent_access
+    # Request a new access token using the POST:ed refresh token
 
-      if response[:refresh_token].present?
-        response[:refresh_token] = encrypt_refresh_token(response[:refresh_token])
-      end
+    http = Net::HTTP.new(SPOTIFY_ACCOUNTS_ENDPOINT.host, SPOTIFY_ACCOUNTS_ENDPOINT.port)
+    http.use_ssl = true
 
-      [httparty_instance.response.code.to_i, response]
-    end
+    request = Net::HTTP::Post.new("/api/token")
 
-    private
+    request.add_field("Authorization", AUTH_HEADER)
 
-    def encrypt_refresh_token(refresh_token)
-      if config.has_encryption_secret?
-        refresh_token.encrypt(:symmetric, password: ENV["ENCRYPTION_SECRET"])
-      end || refresh_token
-    end
-  end
+    encrypted_token = params[:refresh_token]
+    refresh_token = encrypted_token.decrypt(:symmetric, :password => ENCRYPTION_SECRET)
 
-  # SpotifyTokenSwapService::DecryptParameters
-  #
-  # The code needed to apply decryption middleware for refresh tokens.
-  #
-  class DecryptParameters < Struct.new(:params)
-    include ConfigHelper
+    request.form_data = {
+        "grant_type" => "refresh_token",
+        "refresh_token" => refresh_token
+    }
 
-    def initialize(init_params)
-      self.params = init_params.with_indifferent_access
-    end
+    response = http.request(request)
 
-    def refresh_token
-      params[:refresh_token].to_s.gsub("\\n", "\n")
-    end
+    status response.code.to_i
+    return response.body
 
-    def run
-      params.merge({
-        refresh_token: decrypt_refresh_token(refresh_token)
-      })
-    end
-
-    private
-
-    def decrypt_refresh_token(refresh_token)
-      if config.has_encryption_secret?
-        refresh_token.decrypt(:symmetric, password: ENV["ENCRYPTION_SECRET"])
-      end || refresh_token
-    end
-  end
-
-  # SpotifyTokenSwapService::EmptyMiddleware
-  #
-  # Similar to EncryptionMiddleware, but it does nothing except
-  # comply with our DSL for middleware - [status code, response]
-  #
-  class EmptyMiddleware < Struct.new(:httparty_instance)
-    include ConfigHelper
-
-    def run
-      response = httparty_instance.parsed_response.with_indifferent_access
-      [httparty_instance.response.code.to_i, response]
-    end
-  end
-
-  # SpotifyTokenSwapService::App
-  #
-  # The code needed to make it go all Sinatra, beautiful.
-  #
-  class App < Sinatra::Base
-    set :root, File.dirname(__FILE__)
-
-    before do
-      headers "Access-Control-Allow-Origin" => "*",
-              "Access-Control-Allow-Methods" => %w(OPTIONS GET POST)
-    end
-
-    helpers ConfigHelper
-
-    # POST /api/token
-    # Convert an authorization code to an access token.
-    #
-    # @param code The authorization code sent from accounts.spotify.com
-    #
-    post "/api/token" do
-      begin
-        http = HTTP.new.token(auth_code: params[:code])
-        status_code, response = EncryptionMiddleware.new(http).run
-
-        status status_code
-        json response
-      rescue StandardError => e
-        status 400
-        json error: e
-      end
-    end
-
-    # POST /api/refresh_token
-    # Use a refresh token to generate a one-hour access token.
-    #
-    # @param refresh_token The refresh token provided from /api/token
-    #
-    post "/api/refresh_token" do
-      begin
-        refresh_params = DecryptParameters.new(params).run
-        http = HTTP.new.refresh_token(refresh_token: refresh_params[:refresh_token])
-        status_code, response = EmptyMiddleware.new(http).run
-
-        status status_code
-        json response
-      rescue OpenSSL::Cipher::CipherError
-        status 400
-        json error: "invalid refresh_token"
-      rescue StandardError => e
-        status 400
-        json error: e
-      end
-    end
-  end
 end
